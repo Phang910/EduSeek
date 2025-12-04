@@ -1,8 +1,3 @@
-/**
- * EduSeek AI Chatbot
- * Intelligent assistant that answers questions about the website
- */
-
 (function() {
     'use strict';
     
