@@ -1,0 +1,734 @@
+<?php
+/**
+ * Admin - Manage Reviews
+ * View, approve, or delete school reviews
+ */
+
+$page_title = 'Manage Reviews';
+require_once '../config.php';
+require_once '../db.php';
+require_once 'includes/header.php';
+
+$message = '';
+$message_type = '';
+
+// Handle update only (create removed)
+if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action']) && $_POST['action'] === 'update') {
+    $action = $_POST['action'];
+    $review_id = intval($_POST['review_id'] ?? 0);
+    $school_id = intval($_POST['school_id'] ?? 0);
+    $user_id = intval($_POST['user_id'] ?? 0);
+    $location_rating = floatval($_POST['location_rating'] ?? 0);
+    $service_rating = floatval($_POST['service_rating'] ?? 0);
+    $facilities_rating = floatval($_POST['facilities_rating'] ?? 0);
+    $cleanliness_rating = floatval($_POST['cleanliness_rating'] ?? 0);
+    $value_rating = floatval($_POST['value_rating'] ?? 0);
+    $education_rating = floatval($_POST['education_rating'] ?? 0);
+    $comment = isset($_POST['comment']) ? trim($_POST['comment']) : '';
+    $status = trim($_POST['status'] ?? 'Pending');
+    
+    // Calculate overall rating
+    $overall_rating = ($location_rating + $service_rating + $facilities_rating + $cleanliness_rating + $value_rating + $education_rating) / 6;
+    
+    // Validation
+    if (!$school_id || !$user_id) {
+        $message = 'School and user are required';
+        $message_type = 'danger';
+    } elseif ($location_rating < 1 || $location_rating > 5 || 
+              $service_rating < 1 || $service_rating > 5 ||
+              $facilities_rating < 1 || $facilities_rating > 5 ||
+              $cleanliness_rating < 1 || $cleanliness_rating > 5 ||
+              $value_rating < 1 || $value_rating > 5 ||
+              $education_rating < 1 || $education_rating > 5) {
+        $message = 'All ratings must be between 1 and 5';
+        $message_type = 'danger';
+    } else {
+        // Handle photo uploads (max 10)
+        $photo_paths = [];
+        $upload_dir = __DIR__ . '/../uploads/reviews';
+        
+        if (!empty($_FILES['review_photos']['name'][0])) {
+            require_once '../includes/functions.php';
+            $uploaded_count = 0;
+            for ($i = 0; $i < min(10, count($_FILES['review_photos']['name'])); $i++) {
+                if ($_FILES['review_photos']['error'][$i] == UPLOAD_ERR_OK) {
+                    $file = [
+                        'name' => $_FILES['review_photos']['name'][$i],
+                        'type' => $_FILES['review_photos']['type'][$i],
+                        'tmp_name' => $_FILES['review_photos']['tmp_name'][$i],
+                        'error' => $_FILES['review_photos']['error'][$i],
+                        'size' => $_FILES['review_photos']['size'][$i]
+                    ];
+                    
+                    $upload_result = uploadFile($file, $upload_dir, ['jpg', 'jpeg', 'png', 'gif', 'webp'], 5242880); // 5MB max
+                    
+                    if ($upload_result['success']) {
+                        $photo_paths[] = $upload_result['filename'];
+                        $uploaded_count++;
+                    }
+                }
+            }
+        }
+        
+        // Get existing photos if updating
+        $existing_photos = [];
+        if ($action === 'update' && $review_id > 0) {
+            $existing_stmt = $conn->prepare("SELECT photo_paths FROM school_reviews WHERE id = ?");
+            $existing_stmt->bind_param("i", $review_id);
+            $existing_stmt->execute();
+            $existing_result = $existing_stmt->get_result();
+            if ($existing_row = $existing_result->fetch_assoc()) {
+                if (!empty($existing_row['photo_paths'])) {
+                    $existing_photos = json_decode($existing_row['photo_paths'], true) ?: [];
+                }
+            }
+            $existing_stmt->close();
+        }
+        
+        // Merge existing photos with new ones (limit to 10 total)
+        // If updating and no new photos uploaded, keep existing photos
+        if ($action === 'update' && empty($photo_paths)) {
+            $all_photos = $existing_photos;
+        } else {
+            $all_photos = array_merge($existing_photos, $photo_paths);
+            $all_photos = array_slice($all_photos, 0, 10);
+        }
+        $photo_paths_json = !empty($all_photos) ? json_encode($all_photos) : null;
+        
+        // Ensure comment is properly handled
+        // Re-fetch from POST to ensure we have the latest value
+        $comment = isset($_POST['comment']) ? trim($_POST['comment']) : '';
+        // Convert to string explicitly, ensuring empty string if null/false
+        $comment = ($comment !== null && $comment !== false) ? (string)$comment : '';
+        
+        // Ensure photo_paths_json is not null (use empty string if empty)
+        $photo_paths_json = $photo_paths_json !== null ? $photo_paths_json : '';
+        
+        // Update only (create functionality removed)
+        if ($action === 'update') {
+            // Parameters: school_id(i), user_id(i), location_rating(d), service_rating(d), facilities_rating(d),
+            // cleanliness_rating(d), value_rating(d), education_rating(d), overall_rating(d), comment(s), photo_paths_json(s), status(s), review_id(i)
+            // Type string: iidddddddsssi (13 parameters: 3i + 7d + 3s = 13 characters)
+            // Count: i(1) + i(2) + d(3-9) + s(10-12) + i(13) = 13
+            $stmt = $conn->prepare("UPDATE school_reviews SET school_id = ?, user_id = ?, location_rating = ?, service_rating = ?, facilities_rating = ?, cleanliness_rating = ?, value_rating = ?, education_rating = ?, overall_rating = ?, comment = ?, photo_paths = ?, status = ? WHERE id = ?");
+            $stmt->bind_param("iidddddddsssi", $school_id, $user_id, $location_rating, $service_rating, $facilities_rating, $cleanliness_rating, $value_rating, $education_rating, $overall_rating, $comment, $photo_paths_json, $status, $review_id);
+        }
+        
+        if ($stmt->execute()) {
+            $message = 'Review updated successfully.';
+            $message_type = 'success';
+        } else {
+            $message = 'Error updating review: ' . $stmt->error;
+            $message_type = 'danger';
+        }
+        $stmt->close();
+    }
+}
+
+// Handle approve/reject/delete
+if (isset($_GET['action'])) {
+    $review_id = intval($_GET['id'] ?? 0);
+    $action = $_GET['action'];
+    
+    if ($review_id && in_array($action, ['approve', 'reject', 'delete'])) {
+        if ($action == 'delete') {
+            // Get review photos before deleting
+            $stmt = $conn->prepare("SELECT photo_paths FROM school_reviews WHERE id = ?");
+            $stmt->bind_param("i", $review_id);
+            $stmt->execute();
+            $result = $stmt->get_result();
+            $review = $result->fetch_assoc();
+            $stmt->close();
+            
+            // Delete photos
+            if (!empty($review['photo_paths'])) {
+                $photo_paths = json_decode($review['photo_paths'], true);
+                foreach ($photo_paths as $photo) {
+                    $photo_file = __DIR__ . '/../uploads/reviews/' . $photo;
+                    if (file_exists($photo_file)) {
+                        unlink($photo_file);
+                    }
+                }
+            }
+            
+            // Delete review
+            $stmt = $conn->prepare("DELETE FROM school_reviews WHERE id = ?");
+            $stmt->bind_param("i", $review_id);
+            if ($stmt->execute()) {
+                $message = 'Review deleted successfully.';
+                $message_type = 'success';
+            } else {
+                $message = 'Error deleting review.';
+                $message_type = 'danger';
+            }
+        } else {
+            $status = $action == 'approve' ? 'Approved' : 'Rejected';
+            $stmt = $conn->prepare("UPDATE school_reviews SET status = ? WHERE id = ?");
+            $stmt->bind_param("si", $status, $review_id);
+            if ($stmt->execute()) {
+                $message = 'Review ' . strtolower($status) . ' successfully.';
+                $message_type = 'success';
+            } else {
+                $message = 'Error updating review.';
+                $message_type = 'danger';
+            }
+        }
+        $stmt->close();
+    }
+}
+
+// Get edit review
+$edit_review = null;
+if (isset($_GET['edit']) && is_numeric($_GET['edit'])) {
+    $edit_id = intval($_GET['edit']);
+    $stmt = $conn->prepare("SELECT * FROM school_reviews WHERE id = ?");
+    $stmt->bind_param("i", $edit_id);
+    $stmt->execute();
+    $result = $stmt->get_result();
+    $edit_review = $result->fetch_assoc();
+    $stmt->close();
+}
+
+// Get all reviews
+$filter_status = $_GET['status'] ?? 'all';
+$search_school = trim($_GET['search_school'] ?? '');
+$search_comment = trim($_GET['search_comment'] ?? '');
+
+$where_conditions = [];
+$params = [];
+$param_types = '';
+
+if ($filter_status != 'all') {
+    $where_conditions[] = "r.status = ?";
+    $params[] = $filter_status;
+    $param_types .= 's';
+}
+
+if (!empty($search_school)) {
+    $where_conditions[] = "s.name LIKE ?";
+    $params[] = '%' . $search_school . '%';
+    $param_types .= 's';
+}
+
+if (!empty($search_comment)) {
+    $where_conditions[] = "r.comment LIKE ?";
+    $params[] = '%' . $search_comment . '%';
+    $param_types .= 's';
+}
+
+$where_clause = !empty($where_conditions) ? 'WHERE ' . implode(' AND ', $where_conditions) : '';
+
+$sql = "SELECT r.*, s.name as school_name, u.unique_number as user_account_number, u.name as user_name, u.phone_number as user_phone, u.contact as user_contact, u.email as user_email 
+        FROM school_reviews r 
+        LEFT JOIN schools s ON r.school_id = s.id 
+        LEFT JOIN users u ON r.user_id = u.id
+        {$where_clause}
+        ORDER BY r.created_at DESC";
+
+if (!empty($params)) {
+    $stmt = $conn->prepare($sql);
+    $stmt->bind_param($param_types, ...$params);
+    $stmt->execute();
+    $result = $stmt->get_result();
+    $reviews = $result->fetch_all(MYSQLI_ASSOC);
+    $stmt->close();
+} else {
+    $reviews = $conn->query($sql)->fetch_all(MYSQLI_ASSOC);
+}
+?>
+
+<h1 class="mb-4">Manage Reviews</h1>
+
+<?php if ($message): ?>
+<div class="alert alert-<?php echo $message_type; ?> alert-dismissible fade show">
+    <?php echo $message; ?>
+    <button type="button" class="btn-close" data-bs-dismiss="alert"></button>
+</div>
+<?php endif; ?>
+
+
+<!-- Filter and Search -->
+<div class="card mb-4">
+    <div class="card-body">
+        <form method="GET" action="" class="mb-3">
+            <div class="row g-2 mb-3">
+                <div class="col-md-4">
+                    <label class="form-label">Search by School Name</label>
+                    <input type="text" class="form-control" name="search_school" placeholder="Search by school name..." value="<?php echo htmlspecialchars($search_school); ?>">
+                </div>
+                <?php if (!empty($search_school) && !empty($reviews)): ?>
+                <div class="col-md-4">
+                    <label class="form-label">Search by Comment</label>
+                    <input type="text" class="form-control" name="search_comment" placeholder="Search by comment..." value="<?php echo htmlspecialchars($search_comment); ?>">
+                </div>
+                <?php endif; ?>
+                <div class="col-md-4 d-flex align-items-end">
+                    <button class="btn btn-primary me-2" type="submit">
+                        <i class="fas fa-search me-1"></i>Search
+                    </button>
+                    <?php if (!empty($search_school) || !empty($search_comment)): ?>
+                        <a href="?status=<?php echo htmlspecialchars($filter_status); ?>" class="btn btn-secondary">
+                            <i class="fas fa-times me-1"></i>Clear
+                        </a>
+                    <?php endif; ?>
+                </div>
+            </div>
+            <input type="hidden" name="status" value="<?php echo htmlspecialchars($filter_status); ?>">
+        </form>
+        <div class="d-flex gap-2 align-items-center">
+            <label class="mb-0 fw-bold">Filter:</label>
+            <a href="?status=all<?php echo !empty($search_school) ? '&search_school=' . urlencode($search_school) : ''; ?><?php echo !empty($search_comment) ? '&search_comment=' . urlencode($search_comment) : ''; ?>" class="btn btn-sm <?php echo $filter_status == 'all' ? 'btn-primary' : 'btn-outline-primary'; ?>">All</a>
+            <a href="?status=Pending<?php echo !empty($search_school) ? '&search_school=' . urlencode($search_school) : ''; ?><?php echo !empty($search_comment) ? '&search_comment=' . urlencode($search_comment) : ''; ?>" class="btn btn-sm <?php echo $filter_status == 'Pending' ? 'btn-warning' : 'btn-outline-warning'; ?>">Pending</a>
+            <a href="?status=Approved<?php echo !empty($search_school) ? '&search_school=' . urlencode($search_school) : ''; ?><?php echo !empty($search_comment) ? '&search_comment=' . urlencode($search_comment) : ''; ?>" class="btn btn-sm <?php echo $filter_status == 'Approved' ? 'btn-success' : 'btn-outline-success'; ?>">Approved</a>
+            <a href="?status=Rejected<?php echo !empty($search_school) ? '&search_school=' . urlencode($search_school) : ''; ?><?php echo !empty($search_comment) ? '&search_comment=' . urlencode($search_comment) : ''; ?>" class="btn btn-sm <?php echo $filter_status == 'Rejected' ? 'btn-danger' : 'btn-outline-danger'; ?>">Rejected</a>
+        </div>
+    </div>
+</div>
+
+<!-- Reviews Table -->
+<div class="card">
+    <div class="card-header">
+        <h5 class="mb-0">All Reviews (<?php echo count($reviews); ?>)</h5>
+    </div>
+    <div class="card-body">
+        <?php if (!empty($reviews)): ?>
+            <div class="table-responsive">
+                <table class="table table-hover">
+                    <thead>
+                        <tr>
+                            <th>ID</th>
+                            <th>School</th>
+                            <th>User</th>
+                            <th>Rating</th>
+                            <th>Comment</th>
+                            <th>Photos</th>
+                            <th>Date</th>
+                            <th>Status</th>
+                            <th>Actions</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        <?php foreach ($reviews as $review): 
+                            $photo_paths = !empty($review['photo_paths']) ? json_decode($review['photo_paths'], true) : [];
+                        ?>
+                        <tr>
+                            <td><?php echo $review['id']; ?></td>
+                            <td>
+                                <a href="../school-details.php?id=<?php echo $review['school_id']; ?>" target="_blank">
+                                    <?php echo htmlspecialchars($review['school_name']); ?>
+                                </a>
+                            </td>
+                            <td>
+                                <?php if ($review['user_name']): ?>
+                                    <div class="small">
+                                        <strong>Account:</strong> <?php echo htmlspecialchars($review['user_account_number'] ?? 'N/A'); ?><br>
+                                        <strong>Name:</strong> <?php echo htmlspecialchars($review['user_name']); ?><br>
+                                        <strong>Phone:</strong> <?php echo htmlspecialchars($review['user_phone'] ?? $review['user_contact'] ?? 'N/A'); ?><br>
+                                        <strong>Email:</strong> <?php echo htmlspecialchars($review['user_email'] ?? 'N/A'); ?>
+                                    </div>
+                                <?php else: ?>
+                                    <span class="text-muted">Anonymous</span>
+                                <?php endif; ?>
+                            </td>
+                            <td>
+                                <div class="d-flex align-items-center gap-1">
+                                    <?php for ($i = 1; $i <= 5; $i++): ?>
+                                        <?php if ($i <= round($review['overall_rating'])): ?>
+                                            <i class="fas fa-star text-warning"></i>
+                                        <?php else: ?>
+                                            <i class="far fa-star text-muted"></i>
+                                        <?php endif; ?>
+                                    <?php endfor; ?>
+                                    <span class="ms-1 fw-bold"><?php echo number_format($review['overall_rating'], 1); ?></span>
+                                </div>
+                            </td>
+                            <td>
+                                <?php if ($review['comment']): ?>
+                                    <div style="max-width: 300px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;" title="<?php echo htmlspecialchars($review['comment']); ?>">
+                                        <?php echo htmlspecialchars(substr($review['comment'], 0, 100)); ?><?php echo strlen($review['comment']) > 100 ? '...' : ''; ?>
+                                    </div>
+                                <?php else: ?>
+                                    <span class="text-muted">No comment</span>
+                                <?php endif; ?>
+                            </td>
+                            <td>
+                                <?php if (!empty($photo_paths)): ?>
+                                    <span class="badge bg-info"><?php echo count($photo_paths); ?> photo(s)</span>
+                                <?php else: ?>
+                                    <span class="text-muted">-</span>
+                                <?php endif; ?>
+                            </td>
+                            <td><?php echo date('M j, Y', strtotime($review['created_at'])); ?></td>
+                            <td>
+                                <?php
+                                $status_key = strtolower($review['status'] ?? 'pending');
+                                $status_map = [
+                                    'approved' => ['badge' => 'badge-status-approved', 'icon' => 'fa-circle-check'],
+                                    'pending' => ['badge' => 'badge-status-pending', 'icon' => 'fa-clock'],
+                                    'rejected' => ['badge' => 'badge-status-rejected', 'icon' => 'fa-circle-xmark'],
+                                ];
+                                $status_meta = $status_map[$status_key] ?? ['badge' => 'badge-status-neutral', 'icon' => 'fa-circle-info'];
+                                ?>
+                                <span class="badge badge-status <?php echo $status_meta['badge']; ?>">
+                                    <i class="fas <?php echo $status_meta['icon']; ?>"></i>
+                                    <?php echo htmlspecialchars($review['status']); ?>
+                                </span>
+                            </td>
+                            <td>
+                                <div class="action-stack">
+                                    <button type="button"
+                                            class="btn btn-action btn-edit"
+                                            onclick="editReview(<?php echo htmlspecialchars(json_encode($review)); ?>)"
+                                            title="Edit review"
+                                            aria-label="Edit review">
+                                        <i class="fas fa-pen-to-square"></i>
+                                    </button>
+                                    <?php if ($review['status'] != 'Approved'): ?>
+                                        <a href="?action=approve&id=<?php echo $review['id']; ?>"
+                                           class="btn btn-action btn-approve"
+                                           onclick="return confirm('Approve this review?');"
+                                           title="Approve review"
+                                           aria-label="Approve review">
+                                            <i class="fas fa-circle-check"></i>
+                                        </a>
+                                    <?php endif; ?>
+                                    <?php if ($review['status'] != 'Rejected'): ?>
+                                        <a href="?action=reject&id=<?php echo $review['id']; ?>"
+                                           class="btn btn-action btn-reject"
+                                           onclick="return confirm('Reject this review?');"
+                                           title="Reject review"
+                                           aria-label="Reject review">
+                                            <i class="fas fa-circle-xmark"></i>
+                                        </a>
+                                    <?php endif; ?>
+                                    <a href="?action=delete&id=<?php echo $review['id']; ?>"
+                                       class="btn btn-action btn-delete"
+                                       onclick="return confirm('Delete this review? This action cannot be undone.');"
+                                       title="Delete review"
+                                       aria-label="Delete review">
+                                        <i class="fas fa-trash"></i>
+                                    </a>
+                                </div>
+                            </td>
+                        </tr>
+                        <?php endforeach; ?>
+                    </tbody>
+                </table>
+            </div>
+        <?php else: ?>
+            <div class="alert alert-info">
+                <i class="fas fa-info-circle me-2"></i>No reviews found.
+            </div>
+        <?php endif; ?>
+    </div>
+</div>
+
+<?php
+// Get all schools for dropdown
+$schools_query = "SELECT id, name, level FROM schools ORDER BY name";
+$schools_result = $conn->query($schools_query);
+$all_schools = $schools_result->fetch_all(MYSQLI_ASSOC);
+
+// Get all users for dropdown
+$users_query = "SELECT id, name, email FROM users ORDER BY name";
+$users_result = $conn->query($users_query);
+$all_users = $users_result->fetch_all(MYSQLI_ASSOC);
+?>
+
+<!-- Review Modal (Edit Only) -->
+<div class="modal fade" id="reviewModal" tabindex="-1" aria-labelledby="reviewModalLabel" aria-hidden="true">
+    <div class="modal-dialog modal-lg">
+        <div class="modal-content">
+            <div class="modal-header bg-primary text-white">
+                <h5 class="modal-title" id="reviewModalLabel">
+                    <i class="fas fa-star me-2"></i><span id="modalAction">Edit</span> Review
+                </h5>
+                <button type="button" class="btn-close btn-close-white" data-bs-dismiss="modal" aria-label="Close"></button>
+            </div>
+            <form method="POST" action="" id="reviewForm" enctype="multipart/form-data">
+                <input type="hidden" name="action" id="formAction" value="update">
+                <input type="hidden" name="review_id" id="reviewId">
+                <div class="modal-body">
+                    <div class="row mb-3">
+                        <div class="col-md-6">
+                            <label for="school_id" class="form-label">School <span class="text-danger">*</span></label>
+                            <input type="hidden" id="school_id" name="school_id" value="" required>
+                            <input type="text" class="form-control" id="school_search" autocomplete="off" list="school_list" placeholder="Search school by name..." required>
+                            <datalist id="school_list"></datalist>
+                            <small class="text-muted">Start typing to search for a school</small>
+                        </div>
+                        <div class="col-md-6">
+                            <label for="user_id" class="form-label">User <span class="text-danger">*</span></label>
+                            <input type="hidden" id="user_id" name="user_id" value="" required>
+                            <input type="text" class="form-control" id="user_search" autocomplete="off" list="user_list" placeholder="Search user by account number..." required>
+                            <datalist id="user_list"></datalist>
+                            <small class="text-muted">Start typing account number to search for a user</small>
+                        </div>
+                    </div>
+                    
+                    <div class="row mb-3">
+                        <div class="col-md-6">
+                            <label for="location_rating" class="form-label">Location Rating (1-5) <span class="text-danger">*</span></label>
+                            <input type="number" class="form-control" id="location_rating" name="location_rating" min="1" max="5" step="0.1" required>
+                        </div>
+                        <div class="col-md-6">
+                            <label for="service_rating" class="form-label">Service Rating (1-5) <span class="text-danger">*</span></label>
+                            <input type="number" class="form-control" id="service_rating" name="service_rating" min="1" max="5" step="0.1" required>
+                        </div>
+                    </div>
+                    
+                    <div class="row mb-3">
+                        <div class="col-md-6">
+                            <label for="facilities_rating" class="form-label">Facilities Rating (1-5) <span class="text-danger">*</span></label>
+                            <input type="number" class="form-control" id="facilities_rating" name="facilities_rating" min="1" max="5" step="0.1" required>
+                        </div>
+                        <div class="col-md-6">
+                            <label for="cleanliness_rating" class="form-label">Cleanliness Rating (1-5) <span class="text-danger">*</span></label>
+                            <input type="number" class="form-control" id="cleanliness_rating" name="cleanliness_rating" min="1" max="5" step="0.1" required>
+                        </div>
+                    </div>
+                    
+                    <div class="row mb-3">
+                        <div class="col-md-6">
+                            <label for="value_rating" class="form-label">Value Rating (1-5) <span class="text-danger">*</span></label>
+                            <input type="number" class="form-control" id="value_rating" name="value_rating" min="1" max="5" step="0.1" required>
+                        </div>
+                        <div class="col-md-6">
+                            <label for="education_rating" class="form-label">Education Rating (1-5) <span class="text-danger">*</span></label>
+                            <input type="number" class="form-control" id="education_rating" name="education_rating" min="1" max="5" step="0.1" required>
+                        </div>
+                    </div>
+                    
+                    <div class="mb-3">
+                        <label for="comment" class="form-label">Comment</label>
+                        <textarea class="form-control" id="comment" name="comment" rows="4" placeholder="Enter review comment..."></textarea>
+                    </div>
+                    
+                    <div class="mb-3">
+                        <label for="review_photos" class="form-label">Photos</label>
+                        <input type="file" class="form-control" id="review_photos" name="review_photos[]" multiple accept="image/jpeg,image/jpg,image/png,image/gif,image/webp" max="10">
+                        <small class="text-muted">Maximum 10 images, 5MB each. When editing, existing photos will be kept if no new photos are uploaded.</small>
+                        <div id="existingPhotosPreview" class="mt-2"></div>
+                    </div>
+                    
+                    <div class="mb-3">
+                        <label for="status" class="form-label">Status</label>
+                        <select class="form-select" id="status" name="status">
+                            <option value="Pending">Pending</option>
+                            <option value="Approved">Approved</option>
+                            <option value="Rejected">Rejected</option>
+                        </select>
+                    </div>
+                </div>
+                <div class="modal-footer">
+                    <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Cancel</button>
+                    <button type="submit" class="btn btn-primary">
+                        <i class="fas fa-save me-2"></i><span id="submitBtnText">Update</span> Review
+                    </button>
+                </div>
+            </form>
+        </div>
+    </div>
+</div>
+
+<script>
+function resetReviewForm() {
+    document.getElementById('reviewForm').reset();
+    document.getElementById('formAction').value = 'create';
+    document.getElementById('reviewId').value = '';
+    document.getElementById('modalAction').textContent = 'Add';
+    document.getElementById('submitBtnText').textContent = 'Create';
+    document.getElementById('status').value = 'Pending';
+}
+
+function editReview(review) {
+    document.getElementById('formAction').value = 'update';
+    document.getElementById('reviewId').value = review.id;
+    document.getElementById('school_id').value = review.school_id;
+    document.getElementById('user_id').value = review.user_id;
+    
+    // Set school search display
+    const schoolSearch = document.getElementById('school_search');
+    if (schoolSearch && review.school_name) {
+        schoolSearch.value = review.school_name + (review.school_level ? ' - ' + review.school_level : '');
+    }
+    
+    // Set user search display
+    const userSearch = document.getElementById('user_search');
+    if (userSearch && review.user_account_number) {
+        userSearch.value = review.user_account_number + (review.user_name ? ' - ' + review.user_name : '');
+    }
+    
+    document.getElementById('location_rating').value = review.location_rating;
+    document.getElementById('service_rating').value = review.service_rating;
+    document.getElementById('facilities_rating').value = review.facilities_rating;
+    document.getElementById('cleanliness_rating').value = review.cleanliness_rating;
+    document.getElementById('value_rating').value = review.value_rating;
+    document.getElementById('education_rating').value = review.education_rating;
+    document.getElementById('comment').value = review.comment || '';
+    document.getElementById('status').value = review.status || 'Pending';
+    document.getElementById('modalAction').textContent = 'Edit';
+    document.getElementById('submitBtnText').textContent = 'Update';
+    
+    // Display existing photos
+    const existingPhotosPreview = document.getElementById('existingPhotosPreview');
+    existingPhotosPreview.innerHTML = '';
+    if (review.photo_paths) {
+        try {
+            const photos = JSON.parse(review.photo_paths);
+            if (Array.isArray(photos) && photos.length > 0) {
+                const photosContainer = document.createElement('div');
+                photosContainer.className = 'd-flex flex-wrap gap-2';
+                photosContainer.innerHTML = '<small class="text-muted w-100 mb-2">Existing photos (' + photos.length + '):</small>';
+                photos.forEach(photo => {
+                    const img = document.createElement('img');
+                    img.src = '../uploads/reviews/' + photo;
+                    img.className = 'img-thumbnail';
+                    img.style.width = '80px';
+                    img.style.height = '80px';
+                    img.style.objectFit = 'cover';
+                    img.alt = 'Existing photo';
+                    photosContainer.appendChild(img);
+                });
+                existingPhotosPreview.appendChild(photosContainer);
+            }
+        } catch (e) {
+            console.error('Error parsing photo_paths:', e);
+        }
+    }
+    
+    // Clear file input
+    document.getElementById('review_photos').value = '';
+    
+    const modal = new bootstrap.Modal(document.getElementById('reviewModal'));
+    modal.show();
+}
+
+// resetReviewForm removed - Add Review functionality removed
+
+// School and User Search functionality
+document.addEventListener('DOMContentLoaded', function() {
+    const schoolSearch = document.getElementById('school_search');
+    const userSearch = document.getElementById('user_search');
+    const schoolList = document.getElementById('school_list');
+    const userList = document.getElementById('user_list');
+    const schoolIdInput = document.getElementById('school_id');
+    const userIdInput = document.getElementById('user_id');
+    
+    // School search
+    if (schoolSearch && schoolList && schoolIdInput) {
+        let schoolSearchTimeout;
+        schoolSearch.addEventListener('input', function() {
+            clearTimeout(schoolSearchTimeout);
+            const query = this.value.trim();
+            
+            if (query.length < 2) {
+                schoolList.innerHTML = '';
+                schoolIdInput.value = '';
+                return;
+            }
+            
+            schoolSearchTimeout = setTimeout(function() {
+                fetch('../api/search_schools.php?q=' + encodeURIComponent(query))
+                    .then(response => response.json())
+                    .then(data => {
+                        if (data.success) {
+                            schoolList.innerHTML = '';
+                            data.schools.forEach(school => {
+                                const option = document.createElement('option');
+                                option.value = school.display;
+                                option.setAttribute('data-id', school.id);
+                                schoolList.appendChild(option);
+                            });
+                        }
+                    })
+                    .catch(error => console.error('Error searching schools:', error));
+            }, 300);
+        });
+        
+        // When user selects from datalist or changes input
+        schoolSearch.addEventListener('change', function() {
+            const selectedOption = Array.from(schoolList.options).find(opt => opt.value === this.value);
+            if (selectedOption) {
+                schoolIdInput.value = selectedOption.getAttribute('data-id');
+            } else {
+                schoolIdInput.value = '';
+            }
+        });
+        
+        schoolSearch.addEventListener('blur', function() {
+            // Validate that a school was selected
+            if (this.value && !schoolIdInput.value) {
+                alert('Please select a school from the dropdown list.');
+                this.value = '';
+            }
+        });
+    }
+    
+    // User search
+    if (userSearch && userList && userIdInput) {
+        let userSearchTimeout;
+        userSearch.addEventListener('input', function() {
+            clearTimeout(userSearchTimeout);
+            const query = this.value.trim();
+            
+            if (query.length < 1) {
+                userList.innerHTML = '';
+                userIdInput.value = '';
+                return;
+            }
+            
+            userSearchTimeout = setTimeout(function() {
+                fetch('../api/search_users.php?q=' + encodeURIComponent(query))
+                    .then(response => response.json())
+                    .then(data => {
+                        if (data.success) {
+                            userList.innerHTML = '';
+                            data.users.forEach(user => {
+                                const option = document.createElement('option');
+                                option.value = user.display;
+                                option.setAttribute('data-id', user.id);
+                                userList.appendChild(option);
+                            });
+                        }
+                    })
+                    .catch(error => console.error('Error searching users:', error));
+            }, 300);
+        });
+        
+        // When user selects from datalist or changes input
+        userSearch.addEventListener('change', function() {
+            const selectedOption = Array.from(userList.options).find(opt => opt.value === this.value);
+            if (selectedOption) {
+                userIdInput.value = selectedOption.getAttribute('data-id');
+            } else {
+                userIdInput.value = '';
+            }
+        });
+        
+        userSearch.addEventListener('blur', function() {
+            // Validate that a user was selected
+            if (this.value && !userIdInput.value) {
+                alert('Please select a user from the dropdown list.');
+                this.value = '';
+            }
+        });
+    }
+    
+    // Form validation before submit
+    const reviewForm = document.getElementById('reviewForm');
+    if (reviewForm) {
+        reviewForm.addEventListener('submit', function(e) {
+            // Ensure school_id and user_id are set
+            if (!schoolIdInput || !schoolIdInput.value || !userIdInput || !userIdInput.value) {
+                e.preventDefault();
+                alert('Please select a school and user from the dropdown list.');
+                return false;
+            }
+        });
+    }
+});
+</script>
+
+<?php require_once 'includes/footer.php'; ?>
+
